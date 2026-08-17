@@ -15,6 +15,7 @@ import os
 import sqlite3
 import logging
 import asyncio
+import random
 from datetime import datetime
 
 from telegram import (
@@ -42,6 +43,24 @@ DB_PATH = "casino_bot.db"
 CHIP_PACK_AMOUNT = 10      # 100 Stars karsiligi verilecek cip miktari
 CHIP_PACK_PRICE = 100      # Telegram Stars (XTR) tutari
 FREE_START_CHIPS = 1       # /start ile verilecek ucretsiz cip
+
+# --------------------------------------------------------------
+# ODUL TABLOSU (KASA LEHINE)
+# --------------------------------------------------------------
+# Her satir: (kazanilan cip, olasilik, mesaj)
+# Tum olasiliklarin toplami MUTLAKA 1.0 (yani %100) olmali.
+# Ortalama getiri = sum(kazanc * olasilik). 1 spin = 1 cip maliyet oldugu icin
+# bu deger 1'in altinda oldukca kasa kar eder. Su anki tablo ile:
+# ortalama getiri = 0.63 cip / spin -> kasa yaklasik %37 kar eder.
+# Kasayi daha karli yapmak icin buyuk odullerin olasiligini dusur,
+# 0 kazanc satirinin olasiligini yukselt (toplam yine 1.0 olmali).
+PRIZE_TABLE = [
+    (0, 0.70, "😔 Bu sefer kazanamadiniz. Tekrar deneyin!"),
+    (1, 0.20, "✨ Kucuk bir kazanc! *+1 Cip* kazandiniz!"),
+    (2, 0.065, "🎊 Iyi eslesme! *+2 Cip* kazandiniz!"),
+    (5, 0.03, "🔥 Harika! *+5 Cip* kazandiniz!"),
+    (30, 0.005, "🎉 JACKPOT! *+30 Cip* kazandiniz!"),
+]
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -237,23 +256,15 @@ async def successful_payment_callback(update: Update, context: ContextTypes.DEFA
 # ------------------------------------------------------------------
 def calculate_slot_prize(dice_value: int):
     """
-    Telegram 🎰 zar degeri 1-64 arasindadir.
-    Bu deger 3 makaranin kombinasyonunu temsil eder.
+    Odul, PRIZE_TABLE icindeki olasiliklara gore secilir (kasa lehine).
+    dice_value sadece gorsel animasyon icindir, odul miktarini etkilemez.
     """
-    v = dice_value - 1
-    reel1 = v // 16
-    reel2 = (v % 16) // 4
-    reel3 = v % 4
-    symbols = ["BAR", "🍇 Uzum", "🍋 Limon", "7️⃣ Yedi"]
+    outcomes = [row[0] for row in PRIZE_TABLE]
+    weights = [row[1] for row in PRIZE_TABLE]
+    messages = [row[2] for row in PRIZE_TABLE]
 
-    if reel1 == reel2 == reel3:
-        if reel1 == 3:
-            return 50, "🎉 JACKPOT! 7-7-7! *+50 Cip* kazandiniz!"
-        return 15, f"🎊 Uclu eslesme ({symbols[reel1]})! *+15 Cip* kazandiniz!"
-    elif reel1 == reel2 or reel2 == reel3 or reel1 == reel3:
-        return 3, "✨ Ikili eslesme! *+3 Cip* kazandiniz!"
-    else:
-        return 0, "😔 Bu sefer kazanamadiniz. Tekrar deneyin!"
+    index = random.choices(range(len(PRIZE_TABLE)), weights=weights, k=1)[0]
+    return outcomes[index], messages[index]
 
 
 async def handle_spin(query, context: ContextTypes.DEFAULT_TYPE):
