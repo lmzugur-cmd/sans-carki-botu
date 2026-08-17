@@ -15,7 +15,6 @@ import os
 import sqlite3
 import logging
 import asyncio
-import random
 from datetime import datetime
 
 from telegram import (
@@ -38,29 +37,36 @@ from telegram.ext import (
 # AYARLAR
 # ------------------------------------------------------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-DB_PATH = "casino_bot.db"
+# DB_PATH: Railway'de kalici disk (Volume) baglandiysa DB_PATH degiskenini
+# o disk yoluna ayarlayin (orn: /data/casino_bot.db). Ayarlanmazsa, veritabani
+# konteyner ile birlikte silinebilir (kalici olmaz).
+DB_PATH = os.getenv("DB_PATH", "casino_bot.db")
 
 CHIP_PACK_AMOUNT = 10      # 100 Stars karsiligi verilecek cip miktari
 CHIP_PACK_PRICE = 100      # Telegram Stars (XTR) tutari
 FREE_START_CHIPS = 1       # /start ile verilecek ucretsiz cip
+DAILY_BONUS_CHIPS = 1      # gunluk bonus ile verilecek cip
+DAILY_BONUS_HOURS = 24     # gunluk bonus icin bekleme suresi (saat)
 
 # --------------------------------------------------------------
-# ODUL TABLOSU (KASA LEHINE)
+# SEVIYE (ROZET) SISTEMI
 # --------------------------------------------------------------
-# Her satir: (kazanilan cip, olasilik, mesaj)
-# Tum olasiliklarin toplami MUTLAKA 1.0 (yani %100) olmali.
-# Ortalama getiri = sum(kazanc * olasilik). 1 spin = 1 cip maliyet oldugu icin
-# bu deger 1'in altinda oldukca kasa kar eder. Su anki tablo ile:
-# ortalama getiri = 0.63 cip / spin -> kasa yaklasik %37 kar eder.
-# Kasayi daha karli yapmak icin buyuk odullerin olasiligini dusur,
-# 0 kazanc satirinin olasiligini yukselt (toplam yine 1.0 olmali).
-PRIZE_TABLE = [
-    (0, 0.70, "😔 Bu sefer kazanamadiniz. Tekrar deneyin!"),
-    (1, 0.20, "✨ Kucuk bir kazanc! *+1 Cip* kazandiniz!"),
-    (2, 0.065, "🎊 Iyi eslesme! *+2 Cip* kazandiniz!"),
-    (5, 0.03, "🔥 Harika! *+5 Cip* kazandiniz!"),
-    (30, 0.005, "🎉 JACKPOT! *+30 Cip* kazandiniz!"),
+# Esik (toplam kazanilan cip) -> (emoji, isim)
+LEVELS = [
+    (0, "🥚", "Acemi"),
+    (10, "🎯", "Amator"),
+    (50, "🔥", "Usta"),
+    (150, "👑", "Efsane"),
+    (500, "💎", "Kral"),
 ]
+
+
+def get_level(total_won: int):
+    current = LEVELS[0]
+    for threshold, emoji, name in LEVELS:
+        if total_won >= threshold:
+            current = (threshold, emoji, name)
+    return current[1], current[2]
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -85,23 +91,67 @@ def init_db():
         """
     )
     conn.commit()
+
+    # Eski veritabanlarinda olmayabilecek kolonlari ekle (gecis / migration).
+    # Kolon zaten varsa hata verir, bu hatayi guvenle yok sayariz.
+    new_columns = [
+        ("total_won", "INTEGER NOT NULL DEFAULT 0"),
+        ("games_played", "INTEGER NOT NULL DEFAULT 0"),
+        ("last_bonus", "TEXT"),
+        ("display_name", "TEXT NOT NULL DEFAULT ''"),
+    ]
+    for col_name, col_def in new_columns:
+        try:
+            cur.execute(f"ALTER TABLE users ADD COLUMN {col_name} {col_def}")
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass  # kolon zaten var
+
     conn.close()
 
 
-def get_or_create_user(user_id: int) -> dict:
+def get_or_create_user(user_id: int, display_name: str = None) -> dict:
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
-    cur.execute("SELECT user_id, chips, last_spin FROM users WHERE user_id = ?", (user_id,))
+    cur.execute(
+        "SELECT user_id, chips, last_spin, total_won, games_played, last_bonus, display_name "
+        "FROM users WHERE user_id = ?",
+        (user_id,),
+    )
     row = cur.fetchone()
     if row is None:
         cur.execute(
-            "INSERT INTO users (user_id, chips, last_spin) VALUES (?, ?, ?)",
-            (user_id, FREE_START_CHIPS, None),
+            "INSERT INTO users (user_id, chips, last_spin, total_won, games_played, last_bonus, display_name) "
+            "VALUES (?, ?, ?, 0, 0, NULL, ?)",
+            (user_id, FREE_START_CHIPS, None, display_name or ""),
         )
         conn.commit()
-        result = {"user_id": user_id, "chips": FREE_START_CHIPS, "last_spin": None}
+        result = {
+            "user_id": user_id,
+            "chips": FREE_START_CHIPS,
+            "last_spin": None,
+            "total_won": 0,
+            "games_played": 0,
+            "last_bonus": None,
+            "display_name": display_name or "",
+        }
     else:
-        result = {"user_id": row[0], "chips": row[1], "last_spin": row[2]}
+        result = {
+            "user_id": row[0],
+            "chips": row[1],
+            "last_spin": row[2],
+            "total_won": row[3],
+            "games_played": row[4],
+            "last_bonus": row[5],
+            "display_name": row[6],
+        }
+        if display_name and display_name != row[6]:
+            cur.execute(
+                "UPDATE users SET display_name = ? WHERE user_id = ?",
+                (display_name, user_id),
+            )
+            conn.commit()
+            result["display_name"] = display_name
     conn.close()
     return result
 
@@ -134,6 +184,83 @@ def set_last_spin(user_id: int, ts: str):
     conn.close()
 
 
+def record_spin_result(user_id: int, won: int) -> dict:
+    """Bir spin sonucunu isler: cip ekler, toplam kazanc ve oynanan oyun sayisini gunceller."""
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE users SET chips = chips + ?, total_won = total_won + ?, "
+        "games_played = games_played + 1 WHERE user_id = ?",
+        (won, won, user_id),
+    )
+    conn.commit()
+    cur.execute(
+        "SELECT chips, total_won, games_played FROM users WHERE user_id = ?",
+        (user_id,),
+    )
+    row = cur.fetchone()
+    conn.close()
+    return {"chips": row[0], "total_won": row[1], "games_played": row[2]}
+
+
+def get_user_stats(user_id: int) -> dict:
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT chips, total_won, games_played, last_bonus FROM users WHERE user_id = ?",
+        (user_id,),
+    )
+    row = cur.fetchone()
+    conn.close()
+    if row is None:
+        return {"chips": 0, "total_won": 0, "games_played": 0, "last_bonus": None}
+    return {"chips": row[0], "total_won": row[1], "games_played": row[2], "last_bonus": row[3]}
+
+
+def claim_daily_bonus(user_id: int):
+    """
+    Gunluk bonusu vermeye calisir. Basariliysa (True, yeni_bakiye) doner.
+    Basarisizsa (False, kalan_saat) doner.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT last_bonus FROM users WHERE user_id = ?", (user_id,))
+    row = cur.fetchone()
+    last_bonus_str = row[0] if row else None
+
+    now = datetime.utcnow()
+    if last_bonus_str:
+        last_bonus = datetime.fromisoformat(last_bonus_str)
+        elapsed_hours = (now - last_bonus).total_seconds() / 3600
+        if elapsed_hours < DAILY_BONUS_HOURS:
+            remaining = DAILY_BONUS_HOURS - elapsed_hours
+            conn.close()
+            return False, remaining
+
+    cur.execute(
+        "UPDATE users SET chips = chips + ?, last_bonus = ? WHERE user_id = ?",
+        (DAILY_BONUS_CHIPS, now.isoformat(), user_id),
+    )
+    conn.commit()
+    cur.execute("SELECT chips FROM users WHERE user_id = ?", (user_id,))
+    new_balance = cur.fetchone()[0]
+    conn.close()
+    return True, new_balance
+
+
+def get_leaderboard(limit: int = 10):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT display_name, total_won, user_id FROM users "
+        "WHERE total_won > 0 ORDER BY total_won DESC LIMIT ?",
+        (limit,),
+    )
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
 # ------------------------------------------------------------------
 # ARAYUZ (KEYBOARD) YARDIMCILARI
 # ------------------------------------------------------------------
@@ -144,7 +271,9 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
             f"💰 Cip Satin Al ({CHIP_PACK_PRICE} ⭐️ = {CHIP_PACK_AMOUNT} Cip)",
             callback_data="buy",
         )],
-        [InlineKeyboardButton("👤 Profilim / Cip Bakiye", callback_data="profile")],
+        [InlineKeyboardButton("🎁 Gunluk Bonus", callback_data="daily_bonus")],
+        [InlineKeyboardButton("🏆 Liderlik Tablosu", callback_data="leaderboard")],
+        [InlineKeyboardButton("👤 Profilim / Rozetim", callback_data="profile")],
     ]
     return InlineKeyboardMarkup(keyboard)
 
@@ -172,7 +301,8 @@ def buy_or_back_keyboard() -> InlineKeyboardMarkup:
 # ------------------------------------------------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    data = get_or_create_user(user.id)
+    display_name = user.first_name or user.username or "Oyuncu"
+    data = get_or_create_user(user.id, display_name=display_name)
     text = (
         f"👋 Merhaba {user.first_name}!\n\n"
         f"🎰 *Sans Carki Botu*'na hos geldin!\n"
@@ -187,8 +317,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    user_id = query.from_user.id
-    get_or_create_user(user_id)
+    user = query.from_user
+    display_name = user.first_name or user.username or "Oyuncu"
+    get_or_create_user(user.id, display_name=display_name)
 
     if query.data == "spin":
         await handle_spin(query, context)
@@ -196,13 +327,62 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_chip_invoice(update, context)
     elif query.data == "profile":
         await handle_profile(query, context)
+    elif query.data == "daily_bonus":
+        await handle_daily_bonus(query, context)
+    elif query.data == "leaderboard":
+        await handle_leaderboard(query, context)
     elif query.data == "back_menu":
         await query.edit_message_text("🏠 Ana Menu", reply_markup=main_menu_keyboard())
 
 
 async def handle_profile(query, context: ContextTypes.DEFAULT_TYPE):
-    chips = get_chips(query.from_user.id)
-    text = f"👤 *Profilin*\n\n🪙 Cip Bakiyen: *{chips}*"
+    stats = get_user_stats(query.from_user.id)
+    emoji, level_name = get_level(stats["total_won"])
+    text = (
+        f"👤 *Profilin*\n\n"
+        f"🪙 Cip Bakiyen: *{stats['chips']}*\n"
+        f"{emoji} Seviyen: *{level_name}*\n"
+        f"🎯 Toplam Kazanilan Cip: *{stats['total_won']}*\n"
+        f"🎮 Toplam Cevirme: *{stats['games_played']}*"
+    )
+    await query.edit_message_text(
+        text, parse_mode="Markdown", reply_markup=back_menu_keyboard()
+    )
+
+
+async def handle_daily_bonus(query, context: ContextTypes.DEFAULT_TYPE):
+    success, value = claim_daily_bonus(query.from_user.id)
+    if success:
+        text = (
+            f"🎁 Gunluk bonusunu aldin!\n\n"
+            f"*+{DAILY_BONUS_CHIPS} Cip* hesabina eklendi.\n"
+            f"🪙 Guncel Bakiye: *{value} Cip*\n\n"
+            "Yarin tekrar ugra!"
+        )
+    else:
+        hours = int(value)
+        minutes = int((value - hours) * 60)
+        text = (
+            f"⏳ Gunluk bonusunu zaten aldin!\n\n"
+            f"Bir sonraki bonus icin yaklasik *{hours} saat {minutes} dakika* bekle."
+        )
+    await query.edit_message_text(
+        text, parse_mode="Markdown", reply_markup=back_menu_keyboard()
+    )
+
+
+async def handle_leaderboard(query, context: ContextTypes.DEFAULT_TYPE):
+    rows = get_leaderboard(limit=10)
+    if not rows:
+        text = "🏆 *Liderlik Tablosu*\n\nHenuz kimse cip kazanmadi. Ilk sen ol!"
+    else:
+        medals = ["🥇", "🥈", "🥉"]
+        lines = ["🏆 *Liderlik Tablosu* (Toplam Kazanilan Cip)\n"]
+        for i, (display_name, total_won, user_id) in enumerate(rows):
+            rank_icon = medals[i] if i < 3 else f"{i + 1}."
+            name = display_name or "Oyuncu"
+            lines.append(f"{rank_icon} {name} — *{total_won}* cip")
+        text = "\n".join(lines)
     await query.edit_message_text(
         text, parse_mode="Markdown", reply_markup=back_menu_keyboard()
     )
@@ -256,15 +436,23 @@ async def successful_payment_callback(update: Update, context: ContextTypes.DEFA
 # ------------------------------------------------------------------
 def calculate_slot_prize(dice_value: int):
     """
-    Odul, PRIZE_TABLE icindeki olasiliklara gore secilir (kasa lehine).
-    dice_value sadece gorsel animasyon icindir, odul miktarini etkilemez.
+    Odul, Telegram'in gonderdigi GERCEK slot sonucuna (dice_value, 1-64) gore
+    hesaplanir. Ekranda gorunen ile kazanc HER ZAMAN birebir uyusur.
     """
-    outcomes = [row[0] for row in PRIZE_TABLE]
-    weights = [row[1] for row in PRIZE_TABLE]
-    messages = [row[2] for row in PRIZE_TABLE]
+    v = dice_value - 1
+    reel1 = v // 16
+    reel2 = (v % 16) // 4
+    reel3 = v % 4
+    symbols = ["🅱️ BAR", "🍇 Uzum", "🍋 Limon", "7️⃣ Yedi"]
 
-    index = random.choices(range(len(PRIZE_TABLE)), weights=weights, k=1)[0]
-    return outcomes[index], messages[index]
+    if reel1 == reel2 == reel3:
+        if reel1 == 3:
+            return 30, "🎉 JACKPOT! 7️⃣-7️⃣-7️⃣! *+30 Cip* kazandiniz!"
+        return 6, f"🎊 Uclu eslesme ({symbols[reel1]})! *+6 Cip* kazandiniz!"
+    elif reel1 == reel2 or reel2 == reel3 or reel1 == reel3:
+        return 0, "🤏 Yakin kacis! Iki sembol eslesti ama odul yok. Tekrar dene!"
+    else:
+        return 0, "😔 Bu sefer kazanamadiniz. Tekrar deneyin!"
 
 
 async def handle_spin(query, context: ContextTypes.DEFAULT_TYPE):
@@ -289,16 +477,15 @@ async def handle_spin(query, context: ContextTypes.DEFAULT_TYPE):
     dice_message = await context.bot.send_dice(chat_id=chat_id, emoji="🎰")
     dice_value = dice_message.dice.value
 
-    # Telegram'in slot animasyonu yaklasik 4 saniye surer
+    # Telegram'in slot animasyonu yaklasik 4 saniye surer.
+    # Sonucu, animasyon bitmeden ACIKLAMIYORUZ ki gorsel ile mesaj
+    # her zaman birebir uyumlu olsun (onceki "bug gibi" gorunen sorun buydu).
     await asyncio.sleep(4)
 
     won, result_text = calculate_slot_prize(dice_value)
-    if won > 0:
-        new_balance = add_chips(user_id, won)
-    else:
-        new_balance = get_chips(user_id)
+    stats = record_spin_result(user_id, won)
 
-    final_text = f"{result_text}\n\n🪙 Guncel Bakiye: *{new_balance} Cip*"
+    final_text = f"{result_text}\n\n🪙 Guncel Bakiye: *{stats['chips']} Cip*"
     await context.bot.send_message(
         chat_id=chat_id,
         text=final_text,
